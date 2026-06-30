@@ -30,8 +30,8 @@ sub telegram {
         my $nodes = shift;
         my $users = shift;
 
-        my $token = "1376233105:AAHOfU_M97j1gXm1l4xLPpmF_v6CYCxIL3M";
-        my $id = "1089814914";
+        my $token = "xxxxxxxxxxxxxxxxxxxxx";
+        my $id = "xxxxxxxxxxxx";
         my $url = "https://api.telegram.org/bot$token/sendMessage";
         `curl -s -X POST $url -d chat_id=$id -d text="$srv\n $nodes $users\n"`;
 }
