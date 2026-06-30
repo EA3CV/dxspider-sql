@@ -1,0 +1,337 @@
+package Filter_SQL;
+
+use strict;
+use warnings;
+use DBI;
+use DXVars;
+use DXJSON;
+use DXDebug;
+use DXUtil qw(readfilestr);
+use File::Find;
+
+my $json = DXJSON->new->indent(1);
+my $table = 'filters';
+
+sub new {
+    my ($class, $sort, $call, $flag) = @_;
+    $flag = $flag ? "in_" : "";
+    my $self = {
+        sort    => $sort,
+        name    => "$flag$call.pl",
+        filters => {},
+    };
+    bless $self, $class;
+
+    $self->_load_from_db();
+    $self->_compile_all();
+    return $self;
+}
+
+sub _get_dbh {
+	my $dsn  = $main::db_backend eq 'sqlite' ? $main::sqlite_dsn : "dbi:mysql:database=$main::mysql_db;host=$main::mysql_host";
+	my $user = $main::db_backend eq 'sqlite' ? $main::sqlite_dbuser : $main::mysql_user;
+	my $pass = $main::db_backend eq 'sqlite' ? $main::sqlite_dbpass : $main::mysql_pass;
+	return DBI->connect($dsn, $user, $pass, {
+		RaiseError => 1,
+		PrintError => 0,
+		AutoCommit => 1,
+		mysql_enable_utf8mb4 => 1,
+		sqlite_unicode       => 1,
+	});
+}
+
+sub ensure_table_exists {
+	my $dbh = _get_dbh();
+	return unless $dbh;
+
+	my $driver = $dbh->{Driver}->{Name};
+	my $sql;
+
+	if ($driver eq 'mysql') {
+		$sql = qq{
+			CREATE TABLE IF NOT EXISTS $table (
+				id INT AUTO_INCREMENT PRIMARY KEY,
+				list_name VARCHAR(255) NOT NULL,
+				sort VARCHAR(64) NOT NULL,
+				filter_key VARCHAR(64) NOT NULL,
+				rule_type VARCHAR(16) NOT NULL,
+				user_expr TEXT,
+				asc_expr TEXT,
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+		};
+	}
+	elsif ($driver eq 'SQLite') {
+		$sql = qq{
+			CREATE TABLE IF NOT EXISTS $table (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				list_name TEXT NOT NULL,
+				sort TEXT NOT NULL,
+				filter_key TEXT NOT NULL,
+				rule_type TEXT NOT NULL,
+				user_expr TEXT,
+				asc_expr TEXT,
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP
+			);
+		};
+	} else {
+		die "[Filter_SQL] Unsupported DB driver: $driver";
+	}
+
+	my $exists = 0;
+	{
+		local $dbh->{RaiseError} = 0;
+		local $dbh->{PrintError} = 0;
+		my $sth = $dbh->prepare("SELECT 1 FROM $table LIMIT 1");
+		$exists = 1 if $sth && $sth->execute;
+	}
+
+	unless ($exists) {
+		dbg("[Filter_SQL] Table '$table' not found, creating and importing from files...");
+		$dbh->do($sql);
+		_migrate_from_files($dbh);
+	}
+
+	$dbh->disconnect;
+}
+
+sub _migrate_from_files {
+	my ($dbh) = @_;
+	my $base_dir = "$main::root/filter";
+
+	find(sub {
+		return unless -f $_ && $_ =~ /\.pl$/;
+		my $file = $File::Find::name;
+		my ($sort) = $File::Find::dir =~ m{/filter/([^/]+)};
+		my $content = readfilestr($file);
+		unless ($content && $content =~ /^\s*[\[{]/) {
+			dbg("[Filter_SQL] Skipping invalid or empty file: $file");
+			return;
+		}
+
+		my $data = eval { $json->decode($content) };
+		if ($@ || ref $data ne 'HASH') {
+			dbg("[Filter_SQL] JSON decode error in $file: $@");
+			return;
+		}
+
+		(my $list_name = $data->{name}) =~ s/\.pl$//;
+
+		foreach my $key (grep /^filter/, keys %$data) {
+			for my $type (qw(reject accept)) {
+				next unless exists $data->{$key}{$type};
+				my $u = $data->{$key}{$type}{user};
+				my $a = $data->{$key}{$type}{asc};
+				next unless defined $u && defined $a;
+				my $ins = $dbh->prepare("INSERT INTO $table (list_name, sort, filter_key, rule_type, user_expr, asc_expr) VALUES (?, ?, ?, ?, ?, ?)");
+				$ins->execute($list_name, $sort, $key, $type, $u, $a);
+			}
+		}
+	}, $base_dir);
+}
+
+sub _load_from_db {
+	my $self = shift;
+	my $dbh = _get_dbh();
+	return unless $dbh;
+
+	(my $list_name = $self->{name}) =~ s/\.pl$//;
+
+	my $sth = $dbh->prepare("SELECT filter_key, rule_type, user_expr, asc_expr FROM $table WHERE list_name = ? AND sort = ?");
+	$sth->execute($list_name, $self->{sort});
+	while (my ($key, $rtype, $user, $asc) = $sth->fetchrow_array) {
+		$self->{filters}{$key}{$rtype} = {
+			user => $user,
+			asc  => $asc,
+			code => undef,
+		};
+	}
+	$dbh->disconnect;
+}
+
+sub getfilkeys {
+	my $self = shift;
+	return grep { /^filter/ } keys %{ $self->{filters} };
+}
+
+sub getfilters {
+	my $self = shift;
+	return values %{ $self->{filters} };
+}
+
+sub compile {
+	my ($self, $key, $rtype) = @_;
+	my $rule = $self->{filters}{$key}{$rtype};
+	return unless $rule && $rule->{asc};
+	my $s = $rule->{asc};
+	$s =~ s/\$r/\$_[0]/g;
+	$rule->{code} = eval "sub { $s }";
+	dbg("[Filter_SQL] Error compiling $key $rtype: $@") if $@;
+	return $@;
+}
+
+sub write {
+    my $self = shift;
+    my $dbh = _get_dbh();
+    return "[Filter_SQL] Error no DBH" unless $dbh;
+
+    (my $list_name = $self->{name}) =~ s/\.pl$//;
+
+    my $sth_del = $dbh->prepare("DELETE FROM $table WHERE list_name = ? AND sort = ?");
+    $sth_del->execute($list_name, $self->{sort});
+
+    my $sth_ins = $dbh->prepare("INSERT INTO $table (list_name, sort, filter_key, rule_type, user_expr, asc_expr) VALUES (?, ?, ?, ?, ?, ?)");
+    for my $key ($self->getfilkeys) {
+        for my $rtype (qw(reject accept)) {
+            next unless $self->{filters}{$key}{$rtype};
+            my $rule = $self->{filters}{$key}{$rtype};
+            $sth_ins->execute($list_name, $self->{sort}, $key, $rtype, $rule->{user}, $rule->{asc});
+        }
+    }
+    $dbh->disconnect;
+
+    # (opcional) recompilar este objeto en memoria
+    $self->_compile_all() if $self->can('_compile_all');
+
+    return undef;
+}
+
+sub delete {
+    my ($sort, $call, $flag, $fno, $dxchan) = @_;
+
+    my $flag_prefix = $flag ? 'in_' : '';
+    my $name = "$flag_prefix$call";
+    $name =~ s/\.pl$//;
+
+    my $dbh = _get_dbh();
+    return "[Filter_SQL] Error no DBH" unless $dbh;
+
+    if ($fno eq 'all') {
+        my $sth = $dbh->prepare("DELETE FROM $table WHERE list_name = ? AND sort = ?");
+        $sth->execute($name, $sort);
+    } else {
+        my $sth = $dbh->prepare("DELETE FROM $table WHERE list_name = ? AND sort = ? AND filter_key = ?");
+        $sth->execute($name, $sort, "filter$fno");
+    }
+
+    $dbh->disconnect;
+
+    # --- refrescar filtro en memoria para el canal actual ---
+    if ($dxchan) {
+        my $in = $flag ? 'in' : '';
+        Filter::load_dxchan($dxchan, $sort, $in);
+    }
+
+    return undef;  # éxito
+}
+
+sub it {
+	my $self = shift;
+	my @args = @_;
+	my @keys = sort $self->getfilkeys;
+	my $hops = $self->{hops};
+
+	foreach my $key (@keys) {
+		my $filter = $self->{filters}{$key} || {};
+
+		# reject has priority
+		if ($filter->{reject} && $filter->{reject}{code}) {
+			if ( $filter->{reject}{code}->(ref $args[0] ? $args[0] : \@args) ) {
+				return (0, $hops);
+			}
+		}
+
+		# accept: if present, it must match one rule line (OR across keys, in order)
+		if ($filter->{accept} && $filter->{accept}{code}) {
+			if ( $filter->{accept}{code}->(ref $args[0] ? $args[0] : \@args) ) {
+				return (1, $hops);
+			} else {
+				# this accept line didn't match; try next key
+				next;
+			}
+		}
+	}
+
+	# If we got here: no reject hit, and either no accept rules exist, or none matched.
+	# Behaviour consistent with original Filter.pm:
+	#  - if any accept rules exist -> reject (0)
+	#  - otherwise -> accept (1)
+	my $has_accept = 0;
+	foreach my $key (@keys) {
+		my $filter = $self->{filters}{$key} || {};
+		if ($filter->{accept} && $filter->{accept}{code}) { $has_accept = 1; last; }
+	}
+	return ($has_accept ? 0 : 1, $hops);
+}
+
+
+
+
+sub print {
+	my $self = shift;
+	my @out;
+
+	my @keys = $self->getfilkeys;
+	return @out unless @keys;
+
+	(my $basename = $self->{name}) =~ s/\.pl$//;
+	push @out, join(' ', $basename, ':', $self->{sort});
+
+	for my $key (sort @keys) {
+		my $f = $self->{filters}{$key};
+		push @out, " $key reject $f->{reject}{user}" if $f->{reject};
+		push @out, " $key accept $f->{accept}{user}" if $f->{accept};
+	}
+	return @out;
+}
+
+sub install {
+    my ($self, $remove, $dxchan) = @_;
+
+    # Si existe legacy file, borrarlo (opcional)
+    my $filepath = "$main::root/filter/$self->{sort}/$self->{name}";
+    unlink $filepath if -e $filepath;
+
+    # Guardar en DB (y dejar este objeto compilado)
+    my $err = $self->write;
+    return $err if $err;
+
+    # --- refrescar en memoria ---
+    my $name = uc $self->{name};
+    my $sort = $self->{sort};
+    my $in = "";
+    $in = "in" if $name =~ s/^IN_//;
+    $name =~ s/\.PL$//;
+
+    my @dxchan_list;
+    if ($name eq 'NODE_DEFAULT') {
+        @dxchan_list = DXChannel::get_all_nodes();
+    } elsif ($name eq 'USER_DEFAULT') {
+        @dxchan_list = DXChannel::get_all_users();
+    } elsif ($dxchan) {
+        push @dxchan_list, $dxchan;
+    } else {
+        my $c = DXChannel::get($name);
+        push @dxchan_list, $c if $c;
+    }
+
+    for my $ch (@dxchan_list) {
+        my $n = "$in" . lc($sort) . "filter";
+        $ch->{$n} = undef if $remove;          # “delete”
+        Filter::load_dxchan($ch, $sort, $in);  # recargar desde DB
+    }
+
+    return undef;
+}
+
+sub _compile_all {
+    my $self = shift;
+    for my $key ($self->getfilkeys) {
+        for my $rtype (qw(reject accept)) {
+            next unless $self->{filters}{$key}{$rtype} && defined $self->{filters}{$key}{$rtype}{asc};
+            $self->compile($key, $rtype);
+        }
+    }
+}
+
+1;

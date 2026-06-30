@@ -1,0 +1,16 @@
+Build 158r690 - 2026-06-30
+
+- Consolidated the SQL backend into the main Perl tree by removing duplicated local SQL modules where appropriate.
+- Integrated DME, DME Reference and EADB SQL support into the standard Perl modules.
+- Consolidated SQL support for both MariaDB and SQLite backends.
+- Introduced the new SQL table "badip" to replace the previous "badips" implementation, avoiding conflicts with existing installations while preserving backward compatibility.
+- Added automatic creation and schema verification of the "badip" table for both MariaDB and SQLite backends.
+- Updated all SQL code paths related to bad IP management to use the new "badip" table and its new schema.
+- Preserved the legacy "badips" table unchanged for compatibility with previous SQL installations.
+- Fixed an exception in DXChannel::check_cnum_debugging() when connection number debugging was enabled before the connection object was fully initialized.
+- Fixed show/registered for SQL backends.
+- Added the new show/regpass command to display registration and password status for one or all users.
+- Updated SQL export/import utilities and SQL table reporting commands.
+- Improved SQL startup consistency and automatic SQL object initialization.
+- Updated the SQL upgrade documentation in both English and Spanish.
+- General code cleanup, SQL consolidation and synchronization with the Docker/container build tree.

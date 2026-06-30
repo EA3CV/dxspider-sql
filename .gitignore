@@ -1,0 +1,6 @@
+*.swp
+*~
+*.log
+*.tmp
+*.pid
+.DS_Store
