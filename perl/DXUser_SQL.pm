@@ -1,5 +1,7 @@
 package DXUser_SQL;
 
+# Created by Kin EA3CV
+
 use strict;
 use warnings;
 use DBI;
@@ -14,7 +16,8 @@ use File::Copy qw(copy move);
 
 my $dbh;
 my $json  = JSON->new->canonical(1);
-my $table = 'users';
+our $table;
+*table = \$main::mysql_table;
 
 # Field list
 my @FIELDS = qw(
@@ -29,6 +32,11 @@ my @FIELDS = qw(
 
 sub init {
 	my ($mode) = @_;
+
+	die "[DXUser_SQL] \$main::mysql_table is not defined\n"
+		unless defined $table && length $table;
+	die "[DXUser_SQL] invalid table name '$table' in \$main::mysql_table\n"
+		unless $table =~ \A[A-Za-z_][A-Za-z0-9_]*\z;
 
 	my ($dsn, $user, $pass);
 
@@ -46,7 +54,7 @@ sub init {
 			sqlite_unicode => 1,
 		}) or die "[DXUser_SQL] SQLite connect error: $DBI::errstr";
 
-		my $needs_init = $db_missing || !_table_exists('users');
+		my $needs_init = $db_missing || !_table_exists($table);
 		if ($needs_init) {
 			print "[DXUser_SQL] Creating SQLite table: $table...\n";
 			_create_table_if_needed();
@@ -704,6 +712,18 @@ sub _import_from_user_json {
 	CORE::close($fh);
 
 	print "[DXUser_SQL] Imported $count users from user_json\n";
+}
+
+sub finish {
+	return 1 unless $dbh;
+
+	eval {
+		$dbh->disconnect;
+	};
+	warn "[DXUser_SQL] disconnect failed: $@\n" if $@;
+
+	undef $dbh;
+	return 1;
 }
 
 sub recover {
